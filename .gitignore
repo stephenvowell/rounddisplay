@@ -1,0 +1,8 @@
+# WiFi credentials - never commit these
+include/secrets.h
+
+# PlatformIO build output and downloaded libraries
+.pio/
+
+# Editor settings
+.vscode/

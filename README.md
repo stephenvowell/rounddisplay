@@ -6,13 +6,16 @@ A touch watch face for the [Seeed Studio Round Display for XIAO](https://www.see
 ## Features
 
 - Flicker-free analog watch face (240×240 GC9A01, rendered via a full-frame sprite)
-- Real time from the internet: NTP sync over WiFi with automatic hourly re-sync,
-  US Pacific timezone with automatic DST (falls back to the firmware build time
-  if WiFi is unavailable)
+- Real time from the internet: NTP sync over WiFi with automatic hourly re-sync
+  (Arizona MST, no DST; falls back to the firmware build time if WiFi is down)
 - Day of week and date display
+- **Weather face** for Sierra Vista, AZ via [Open-Meteo](https://open-meteo.com/)
+  (free API, no key): current temp, conditions, today's high/low, humidity, and
+  wind — refreshes every 10 minutes. Location is fixed by latitude/longitude in
+  `src/main.cpp` (not auto-detected)
 - **Tap to interact** (CHSC6X capacitive touch): each tap cycles through four
-  color themes, then a **stopwatch** — tap to start, tap to stop, tap to reset
-  and return to the clock
+  color themes, then **weather**, then a **stopwatch** — tap to start, tap to
+  stop, tap to reset and return to the clock
 
 ## Setup
 
@@ -67,6 +70,18 @@ library.
 | `include/secrets.h.example` | Template for WiFi credentials |
 | `tools/patch_tft_espi_c3.py` | TFT_eSPI ESP32-C3 crash fix (pre-build) |
 | `tools/serial_capture.py` | Helper: dump serial output for N seconds |
+
+## Changing the weather location
+
+Edit these three constants near the top of `src/main.cpp`:
+
+```cpp
+static const float WEATHER_LAT = 31.55f;     // your latitude
+static const float WEATHER_LON = -110.28f;   // your longitude
+static const char *WEATHER_PLACE = "SIERRA VISTA";  // label on screen
+```
+
+Right-click your town on Google Maps to copy coordinates.
 
 ## Ideas for next steps
 

@@ -13,7 +13,12 @@
 //      one go. Drawing off-screen first is what makes it flicker-free.
 //   3. It watches the touch controller. Each tap anywhere on the glass
 //      advances one step through a cycle: the four color themes, then a
-//      stopwatch screen (tap to start, tap to stop, tap to reset & return).
+//      weather screen, then a stopwatch screen (tap to start, tap to stop,
+//      tap to reset & return).
+//   4. Weather comes from Open-Meteo (free, no API key). The location is
+//      fixed to Sierra Vista AZ via latitude/longitude -- it does NOT auto-
+//      detect where you are (IP geolocation is unreliable on mobile WiFi).
+//      Data refreshes every 10 minutes in the background while WiFi is up.
 //
 // Hardware connections (all fixed by the display board, nothing to wire):
 //   - Display:  SPI bus  (config lives in platformio.ini as build flags)
@@ -21,21 +26,21 @@
 // ============================================================================
 
 #include <Arduino.h>
-#include <WiFi.h>    // ESP32 WiFi (used only to reach the NTP time servers)
-#include <Wire.h>    // I2C bus (talks to the touch controller)
-#include <time.h>    // standard C time functions (time, localtime, mktime)
+#include <HTTPClient.h>  // makes web requests (used for the weather API)
+#include <WiFi.h>        // ESP32 WiFi (reaches the NTP and weather servers)
+#include <Wire.h>        // I2C bus (talks to the touch controller)
+#include <time.h>        // standard C time functions (time, localtime, mktime)
 
-#include <TFT_eSPI.h>  // display driver library
+#include <ArduinoJson.h>  // parses the JSON the weather API returns
+#include <TFT_eSPI.h>     // display driver library
 
 #include "esp_sntp.h"  // lets us register a "time was synced" callback
 #include "secrets.h"   // your WiFi name + password (include/secrets.h)
 
 // Timezone rule string in POSIX format:
-//   PST8PDT  = Pacific Standard Time, 8 hours behind UTC, with DST ("PDT")
-//   M3.2.0   = DST starts 2nd Sunday of March
-//   M11.1.0  = DST ends 1st Sunday of November
-// The C time library uses this to convert UTC into your local wall time.
-static const char *TZ_INFO = "PST8PDT,M3.2.0,M11.1.0";
+//   MST7 = Mountain Standard Time, 7 hours behind UTC, and nothing after the
+//   "7" means NO daylight saving -- Arizona stays on MST all year.
+static const char *TZ_INFO = "MST7";
 
 // ================================ TOUCH =====================================
 // The display has a CHSC6X capacitive touch chip on the I2C bus.
@@ -90,14 +95,114 @@ static const Theme THEMES[] = {
 static const uint8_t THEME_COUNT = sizeof(THEMES) / sizeof(THEMES[0]);
 static uint8_t themeIdx = 0;  // which theme is currently shown
 
+// =============================== WEATHER ====================================
+// Three functions work together:
+//
+//   fetchWeather()     -- downloads JSON from Open-Meteo over WiFi (loop calls
+//                       this every 10 min; see WEATHER_REFRESH_MS below)
+//   weatherCodeText()  -- turns the API's numeric "weather code" into words
+//   drawWeather()      -- paints the weather screen (called from loop when
+//                       mode == MODE_WEATHER)
+//
+// Location is NOT auto-detected. Change WEATHER_LAT, WEATHER_LON, and
+// WEATHER_PLACE if you move. On Google Maps: right-click your town and the
+// coordinates appear in the menu.
+
+static const float WEATHER_LAT = 31.55f;     // Sierra Vista, AZ
+static const float WEATHER_LON = -110.28f;
+static const char *WEATHER_PLACE = "SIERRA VISTA";
+static const uint32_t WEATHER_REFRESH_MS = 10UL * 60 * 1000;  // every 10 min
+
+// Cached copy of the last good API response. `valid` stays false until the
+// first successful fetch, so drawWeather() shows "LOADING..." until then.
+struct Weather {
+  bool valid = false;
+  float tempF = 0;     // current temperature (°F)
+  float hiF = 0;       // today's forecast high
+  float loF = 0;       // today's forecast low
+  float windMph = 0;   // current wind speed (mph)
+  int humidity = 0;    // relative humidity (%)
+  int code = 0;        // WMO weather code (0=clear, 61=rain, etc.)
+};
+static Weather wx;
+static uint32_t lastWxFetchMs = 0;  // millis() of last fetchWeather() call
+
+// Open-Meteo returns a WMO "weather code" (an international standard number).
+// This helper maps that number to a short English label for the display.
+// Full table: https://open-meteo.com/en/docs (section "WMO Weather codes")
+static const char *weatherCodeText(int code) {
+  if (code == 0) return "CLEAR";
+  if (code <= 2) return "PARTLY CLOUDY";
+  if (code == 3) return "OVERCAST";
+  if (code <= 48) return "FOG";
+  if (code <= 57) return "DRIZZLE";
+  if (code <= 67) return "RAIN";
+  if (code <= 77) return "SNOW";
+  if (code <= 82) return "SHOWERS";
+  if (code <= 86) return "SNOW SHOWERS";
+  return "THUNDERSTORM";
+}
+
+// Downloads current weather from Open-Meteo and fills the global `wx` struct.
+//
+// The URL asks for:
+//   - "current" block: right-now temp, humidity, weather code, wind
+//   - "daily" block:   today's high and low (index [0] = today)
+// Units are requested as Fahrenheit and mph so we don't convert in code.
+//
+// This blocks for ~1 second while the HTTP request completes. That is fine
+// because loop() only calls it every 10 minutes, not every frame.
+static void fetchWeather() {
+  char url[256];
+  snprintf(url, sizeof(url),
+           "http://api.open-meteo.com/v1/forecast?latitude=%.2f&longitude=%.2f"
+           "&current=temperature_2m,relative_humidity_2m,weather_code,"
+           "wind_speed_10m"
+           "&daily=temperature_2m_max,temperature_2m_min&forecast_days=1"
+           "&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone=auto",
+           WEATHER_LAT, WEATHER_LON);
+
+  HTTPClient http;
+  http.begin(url);
+  http.setTimeout(5000);  // give up after 5 seconds rather than hang forever
+  int status = http.GET();
+  if (status == 200) {  // 200 = HTTP "OK, here is your data"
+    // Parse the JSON body into a tree we can read by key name.
+    JsonDocument doc;
+    if (deserializeJson(doc, http.getString()) == DeserializationError::Ok) {
+      // Bracket syntax walks the JSON: doc["current"]["temperature_2m"]
+      // is the same as current.temperature_2m in the raw response.
+      wx.tempF = doc["current"]["temperature_2m"];
+      wx.humidity = doc["current"]["relative_humidity_2m"];
+      wx.code = doc["current"]["weather_code"];
+      wx.windMph = doc["current"]["wind_speed_10m"];
+      wx.hiF = doc["daily"]["temperature_2m_max"][0];  // [0] = today
+      wx.loF = doc["daily"]["temperature_2m_min"][0];
+      wx.valid = true;
+      Serial.printf("[wx] %.0fF %s, H %.0f L %.0f, RH %d%%, wind %.0f mph\n",
+                    wx.tempF, weatherCodeText(wx.code), wx.hiF, wx.loF,
+                    wx.humidity, wx.windMph);
+    }
+  } else {
+    Serial.printf("[wx] fetch failed, HTTP status %d\n", status);
+  }
+  http.end();
+
+  // On success, wait the full 10 minutes before fetching again.
+  // On failure, retry in 1 minute (by back-dating lastWxFetchMs).
+  lastWxFetchMs = wx.valid ? millis()
+                           : millis() - WEATHER_REFRESH_MS + 60000;
+}
+
 // ================================ MODES =====================================
 // Each tap moves one step through this cycle:
 //
-//   theme 1 -> theme 2 -> theme 3 -> theme 4 -> STOPWATCH (ready)
+//   theme 1 -> theme 2 -> theme 3 -> theme 4 -> WEATHER -> STOPWATCH (ready)
 //        -> tap: stopwatch RUNNING -> tap: stopwatch STOPPED
 //        -> tap: reset and back to theme 1
 enum Mode : uint8_t {
   MODE_CLOCK,    // normal watch face (taps cycle the color themes)
+  MODE_WEATHER,  // current conditions for WEATHER_PLACE
   SW_READY,      // stopwatch screen showing 00:00.0, waiting to start
   SW_RUNNING,    // stopwatch counting up
   SW_STOPPED,    // stopwatch frozen at the final time
@@ -270,16 +375,70 @@ static void drawStopwatch() {
   frame.pushSprite(0, 0);
 }
 
+// Draws the weather screen. Layout (top to bottom, all centered):
+//
+//   SIERRA VISTA          <- WEATHER_PLACE (accent color)
+//   PARTLY CLOUDY         <- weatherCodeText(wx.code)
+//        95 F             <- big temp (font 6) + small "F" beside it
+//   H 96   L 73           <- today's high / low from the daily forecast
+//   RH 20%  WIND 8        <- humidity and wind from the current block
+//
+// Uses the same ring/ticks and theme colors as the clock and stopwatch.
+// Reach this screen by tapping through all four color themes on the clock.
+static void drawWeather() {
+  const Theme &t = THEMES[themeIdx];
+  drawRingAndTicks(t);
+
+  frame.setTextDatum(MC_DATUM);  // x,y = center of each text string
+  frame.setTextColor(t.accent, t.bg);
+  frame.drawString(WEATHER_PLACE, CX, CY - 62, 2);
+
+  if (!wx.valid) {
+    // WiFi not up yet, or fetchWeather() hasn't finished its first request.
+    frame.setTextColor(t.text, t.bg);
+    frame.drawString("LOADING...", CX, CY, 4);
+    frame.pushSprite(0, 0);
+    return;
+  }
+
+  // Condition label, e.g. "CLEAR" or "RAIN"
+  frame.setTextColor(t.text, t.bg);
+  frame.drawString(weatherCodeText(wx.code), CX, CY - 38, 2);
+
+  // Big current temperature. Font 6 is digits-only, so draw "F" separately
+  // to the right of the number (textWidth tells us how wide the digits are).
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%.0f", wx.tempF);
+  int w = frame.textWidth(buf, 6);
+  frame.drawString(buf, CX, CY, 6);
+  frame.setTextColor(t.accent, t.bg);
+  frame.drawString("F", CX + w / 2 + 12, CY - 12, 4);
+
+  // Today's range and live humidity/wind (from the last fetchWeather() call).
+  frame.setTextColor(t.text, t.bg);
+  snprintf(buf, sizeof(buf), "H %.0f   L %.0f", wx.hiF, wx.loF);
+  frame.drawString(buf, CX, CY + 40, 2);
+  snprintf(buf, sizeof(buf), "RH %d%%  WIND %.0f", wx.humidity, wx.windMph);
+  frame.drawString(buf, CX, CY + 60, 2);
+
+  frame.pushSprite(0, 0);
+}
+
 // Decides what one tap does, based on which screen we're on.
 static void handleTap() {
   switch (mode) {
     case MODE_CLOCK:
-      // Cycle the dial color; after the last theme, enter the stopwatch.
+      // Cycle the dial color; after the last theme, show the weather.
       if (themeIdx + 1 < THEME_COUNT) {
         themeIdx++;
       } else {
-        mode = SW_READY;  // stopwatch keeps the last theme's colors
+        mode = MODE_WEATHER;  // weather keeps the last theme's colors
       }
+      break;
+    case MODE_WEATHER:
+      // One tap leaves weather and enters the stopwatch (data keeps updating
+      // in the background even while you're on other screens).
+      mode = SW_READY;
       break;
     case SW_READY:  // first tap on the stopwatch screen: start counting
       swStartMs = millis();
@@ -379,7 +538,17 @@ void loop() {
     configTzTime(TZ_INFO, "pool.ntp.org", "time.google.com", "time.nist.gov");
   }
 
-  // ---- Touch: each tap advances the theme/stopwatch cycle ----
+  // ---- Weather: fetch from Open-Meteo every 10 min (needs WiFi) ----
+  // `ntpStarted` is our "WiFi is connected" flag (set when NTP kicks off).
+  // `lastWxFetchMs == 0` means we have never fetched yet -- do it right away.
+  // fetchWeather() updates `wx`; drawWeather() reads it when you're on that
+  // screen, but the cache is kept warm even while you're on the clock face.
+  if (ntpStarted &&
+      (lastWxFetchMs == 0 || millis() - lastWxFetchMs >= WEATHER_REFRESH_MS)) {
+    fetchWeather();
+  }
+
+  // ---- Touch: each tap advances theme -> weather -> stopwatch -> clock ----
   // The 350 ms check is a "debounce": one tap produces many touch readings
   // in a row, and without it one tap would count as several.
   static uint32_t lastTouchMs = 0;
@@ -395,8 +564,11 @@ void loop() {
   static uint32_t lastFrameMs = 0;
   if (millis() - lastFrameMs >= 50) {
     lastFrameMs = millis();
+    // Pick which screen to paint this frame based on the current mode.
     if (mode == MODE_CLOCK) {
       drawClock();
+    } else if (mode == MODE_WEATHER) {
+      drawWeather();   // reads cached `wx` (no network call here)
     } else {
       drawStopwatch();
     }

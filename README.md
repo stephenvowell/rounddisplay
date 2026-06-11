@@ -1,4 +1,4 @@
-# Round Display Watch — XIAO ESP32-C3
+# Seeed Studio Round Display Clock and Stopwatch
 
 A touch watch face for the [Seeed Studio Round Display for XIAO](https://www.seeedstudio.com/1-28-Round-Touch-Display-for-Seeed-Studio-XIAO-ESP32.html)
 (SKU 104030087) stacked on a **XIAO ESP32-C3**.
